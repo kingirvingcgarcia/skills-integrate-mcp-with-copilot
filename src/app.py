@@ -5,11 +5,16 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import secrets
+import time
+
+from teacher_auth import verify_teacher_credentials
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +23,35 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+teacher_sessions: dict[str, tuple[str, float]] = {}
+teacher_session_ttl_seconds = 8 * 60 * 60
+
+
+class TeacherCredentials(BaseModel):
+    username: str
+    password: str
+
+
+def require_teacher(authorization: str | None = Header(default=None)) -> str:
+    if authorization is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Teacher sign-in required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    scheme, _, token = authorization.partition(" ")
+    session = teacher_sessions.get(token) if scheme.lower() == "bearer" else None
+    if session is None or session[1] <= time.time():
+        teacher_sessions.pop(token, None)
+        raise HTTPException(
+            status_code=401,
+            detail="Teacher sign-in required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return session[0]
 
 # In-memory activity database
 activities = {
@@ -88,8 +122,34 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login_teacher(credentials: TeacherCredentials):
+    if not verify_teacher_credentials(credentials.username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(32)
+    teacher_sessions[token] = (
+        credentials.username,
+        time.time() + teacher_session_ttl_seconds,
+    )
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/auth/logout")
+def logout_teacher(authorization: str | None = Header(default=None)):
+    if authorization is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            teacher_sessions.pop(token, None)
+    return {"message": "Signed out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    _teacher_username: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +171,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    _teacher_username: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
